@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     app_name: str = "Ops Agent Domain API"
-    database_url: str = "postgresql+psycopg://ops_agent:ops_agent@db:5432/ops_agent"
+    database_url: str
 
     model_config = SettingsConfigDict(
         env_file=".env",
