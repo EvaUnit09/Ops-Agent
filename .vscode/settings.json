@@ -1,4 +1,7 @@
 {
     "python.defaultInterpreterPath": "${workspaceFolder}/api/.venv/bin/python",
-    "python.analysis.extraPaths": ["${workspaceFolder}/api"]
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/api"
+    ],
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }
