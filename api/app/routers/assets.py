@@ -16,7 +16,6 @@ Limit = Annotated[int, Query(ge=1, le=100)]
 
 @router.get("/search", response_model=ApiResponse[list[AssetRead]])
 def search_assets(
-    q: Annotated[str | None, Query(min_length=1, max_length=100)] = None,
     category: AssetCategory | None = None,
     status_filter: Annotated[
         AssetStatus | None,
@@ -26,12 +25,7 @@ def search_assets(
     limit: Limit = 50,
     session: Session = Depends(get_db),
 ) -> ApiResponse[list[AssetRead]]:
-    if q is not None and not q.strip():
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="q must contain a non-whitespace character",
-        )
-    items = services.search_assets(session, q, category, status_filter, region, limit)
+    items = services.search_assets(session, category, status_filter, region, limit)
     return success(items, count=len(items), limit=limit)
 
 

@@ -13,7 +13,7 @@ Request flow:
 
 The response is `{answer, thread_id, tool_rounds, soft_limit_reached}`. The exact tool contracts are:
 
-- `search_assets(category?, status?, region?)` → `GET /assets/search`
+- `search_assets(category?, status?, region?, limit?)` → `GET /assets/search`
 - `find_stale_assets(stale_days, category?, status?, region?)` → `GET /assets/stale`
 - `get_assets_by_department(department, category?, status?, region?, stale_days?)` → `GET /assets/by-department`
 - `get_checkout_history` → `GET /checkouts/asset/{id}`
@@ -43,6 +43,7 @@ agent/
     ├── __init__.py
     ├── conftest.py
     ├── test_api_client.py
+    ├── test_chat.py
     ├── test_graph.py
     ├── test_main.py
     ├── test_routing.py
@@ -167,10 +168,12 @@ class Settings(BaseSettings):
     api_base_url: str = Field(default="http://api:8000", alias="API_BASE_URL")
     checkpoint_database_url: str = Field(alias="CHECKPOINT_DATABASE_URL")
     checkpoint_schema: str = Field(default="agent_checkpoints", alias="CHECKPOINT_SCHEMA")
-    api_timeout_seconds: float = Field(default=3.0, gt=0, alias="API_TIMEOUT_SECONDS")
+    api_timeout_seconds: float = Field(default=5.0, gt=0, alias="API_TIMEOUT_SECONDS")
+    api_max_retries: int = Field(default=2, ge=0, alias="API_MAX_RETRIES")
     api_retry_delay_seconds: float = Field(default=0.1, ge=0, alias="API_RETRY_DELAY_SECONDS")
     max_tool_rounds: int = Field(default=4, ge=1, le=10, alias="MAX_TOOL_ROUNDS")
-    recursion_limit: int = Field(default=30, ge=5, le=100, alias="RECURSION_LIMIT")
+    recursion_limit: int = Field(default=25, ge=5, le=100, alias="RECURSION_LIMIT")
+    cors_origins: str = Field(default="http://localhost:5173", alias="CORS_ORIGINS")
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(
         default="INFO", alias="LOG_LEVEL"
     )
@@ -201,13 +204,15 @@ ANTHROPIC_MODEL=claude-sonnet-4-6
 API_BASE_URL=http://api:8000
 CHECKPOINT_DATABASE_URL=postgresql://opsagent:changeme@db:5432/opsagent
 CHECKPOINT_SCHEMA=agent_checkpoints
-API_TIMEOUT_SECONDS=3
+API_TIMEOUT_SECONDS=5
+API_MAX_RETRIES=2
 API_RETRY_DELAY_SECONDS=0.1
 MAX_TOOL_ROUNDS=4
-RECURSION_LIMIT=30
+RECURSION_LIMIT=25
+CORS_ORIGINS=http://localhost:5173
 ```
 
-The agent may share a PostgreSQL server with the API, but owns only its checkpoint schema. Validate and SQL-quote the schema; never interpolate unchecked input. `API_BASE_URL=http://api:8000` is the Compose-internal domain API address. It is intentionally separate from `VITE_AGENT_URL=http://localhost:8001`, the browser-visible build-time address for the agent.
+The agent may share a PostgreSQL server with the API, but owns only its checkpoint schema. Validate and SQL-quote the schema; never interpolate unchecked input. `API_BASE_URL=http://api:8000` is the Compose-internal domain API address. It is intentionally separate from `VITE_AGENT_URL=http://localhost:8001`, the browser-visible build-time address for the agent. `CORS_ORIGINS` is a comma-separated list of exact browser origins allowed through the agent's CORS middleware; the local default is the Vite dev server's origin.
 
 ### `agent/app/schemas.py`
 
@@ -288,80 +293,82 @@ The finalizer has separate instructions and no bound tools. Simply ending after 
 
 ```python
 import asyncio
-from copy import deepcopy
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
+ErrorKind = Literal["invalid_request", "not_found", "upstream_unavailable", "unexpected_response"]
 
-class DomainApiError(RuntimeError):
-    """Safe domain API failure."""
+
+class DomainApiError(Exception):
+    def __init__(self, kind: ErrorKind, message: str) -> None:
+        self.kind = kind
+        self.message = message
+        super().__init__(message)
 
 
 class DomainApiClient:
-    RETRYABLE = {502, 503, 504}
+    _RETRYABLE_STATUSES = frozenset({502, 503, 504})
 
     def __init__(
         self,
-        base_url: str,
+        http: httpx.AsyncClient,
         *,
-        timeout_seconds: float = 3.0,
+        max_retries: int = 2,
         retry_delay_seconds: float = 0.1,
-        client: httpx.AsyncClient | None = None,
     ) -> None:
-        self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(
-            base_url=base_url.rstrip("/"),
-            timeout=httpx.Timeout(timeout_seconds),
-        )
+        self._http = http
+        self._max_retries = max_retries
         self._retry_delay = retry_delay_seconds
 
-    async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
-
-    async def get(
-        self,
-        path: str,
-        *,
-        params: dict[str, Any] | None = None,
-        empty: Any,
-    ) -> Any:
+    async def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         clean = {key: value for key, value in (params or {}).items() if value is not None}
-        for attempt in range(2):
+        attempts = self._max_retries + 1
+        for attempt in range(attempts):
+            is_last_attempt = attempt == attempts - 1
             try:
-                response = await self._client.get(path, params=clean)
+                response = await self._http.get(path, params=clean)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
-                if attempt == 0:
+                if not is_last_attempt:
                     await asyncio.sleep(self._retry_delay)
                     continue
-                raise DomainApiError("domain API is temporarily unavailable") from exc
+                raise DomainApiError(
+                    "upstream_unavailable", "domain API is temporarily unavailable"
+                ) from exc
 
-            if response.status_code == 404:
-                return deepcopy(empty)
-            if response.status_code in self.RETRYABLE and attempt == 0:
+            if response.status_code in self._RETRYABLE_STATUSES and not is_last_attempt:
                 await asyncio.sleep(self._retry_delay)
                 continue
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
+            if response.status_code == 404:
+                raise DomainApiError("not_found", f"{path} was not found")
+            if response.status_code == 422:
+                raise DomainApiError("invalid_request", "invalid request")
+            if response.status_code in self._RETRYABLE_STATUSES or response.status_code == 500:
                 raise DomainApiError(
-                    f"domain API request failed with status {response.status_code}"
-                ) from exc
+                    "upstream_unavailable", "domain API is temporarily unavailable"
+                )
+            if response.status_code != 200:
+                raise DomainApiError(
+                    "unexpected_response", f"unexpected status {response.status_code}"
+                )
             try:
                 payload = response.json()
             except ValueError as exc:
-                raise DomainApiError("domain API returned invalid JSON") from exc
+                raise DomainApiError(
+                    "unexpected_response", "domain API returned invalid JSON"
+                ) from exc
             if not isinstance(payload, dict) or not {"data", "error", "meta"} <= payload.keys():
-                raise DomainApiError("domain API returned a malformed envelope")
+                raise DomainApiError(
+                    "unexpected_response", "domain API returned a malformed envelope"
+                )
             if payload["error"] is not None:
-                raise DomainApiError("domain API reported an application error")
-            data = payload["data"]
-            return deepcopy(empty) if data is None else data
-        raise DomainApiError("domain API is temporarily unavailable")
+                raise DomainApiError(
+                    "unexpected_response", "domain API reported an application error"
+                )
+            return payload["data"]
 ```
 
-There are exactly two attempts: original plus one retry. Retry only timeout/transport failures and 502/503/504; validation and other application errors need correction, not repetition. The default timeout is three seconds. Every successful response must be the canonical `{"data": ..., "error": null, "meta": ...}` envelope. A non-null envelope `error` becomes a generic `DomainApiError` so server details are not exposed. `404` and enveloped `data: null` become a fresh caller-provided empty value; enveloped `data: []` remains empty. Missing envelope fields and non-object payloads are malformed responses.
+The client makes up to `1 + max_retries` attempts (default three: one original plus two retries). Retry only timeout/transport failures and 502/503/504; validation, not-found, and other application errors need correction, not repetition. The default timeout lives on the injected `httpx.AsyncClient`, not on this class—`main.py`'s lifespan builds that client from `API_TIMEOUT_SECONDS` (default five seconds) and hands it in, which is also what makes `agent/tests/conftest.py`'s `make_client` fixture work with a `MockTransport`. A `404` always raises `not_found`; it is never silently treated as an empty result—a lookup that can legitimately be empty returns `data: []` inside a `200` envelope instead, and that empty list passes straight through. Every successful response must be the canonical `{"data": ..., "error": null, "meta": ...}` envelope; a non-null envelope `error`, invalid JSON, or a missing envelope key all raise `unexpected_response` so server details are never exposed to the model.
 
 ### `agent/app/tools.py`
 
@@ -391,6 +398,12 @@ class SearchAssetsArgs(StrictArgs):
     category: Category | None = Field(default=None, description="Exact category.")
     status: Status | None = Field(default=None, description="Exact status.")
     region: Region | None = Field(default=None, description="Exact region.")
+    limit: int | None = Field(
+        default=None,
+        ge=1,
+        le=100,
+        description="Maximum results to return; server defaults to 50 when omitted.",
+    )
 
 
 class FindStaleAssetsArgs(StrictArgs):
@@ -452,13 +465,18 @@ def build_tools(client: DomainApiClient) -> Sequence[BaseTool]:
         category: Category | None = None,
         status: Status | None = None,
         region: Region | None = None,
+        limit: int | None = None,
     ) -> str:
-        """Search assets by optional exact category, status, and region."""
+        """Search assets by optional exact category, status, region, and limit."""
         return _result(
             await client.get(
                 "/assets/search",
-                params={"category": category, "status": status, "region": region},
-                empty=[],
+                params={
+                    "category": category,
+                    "status": status,
+                    "region": region,
+                    "limit": limit,
+                },
             )
         )
 
@@ -479,7 +497,6 @@ def build_tools(client: DomainApiClient) -> Sequence[BaseTool]:
                     "status": status,
                     "region": region,
                 },
-                empty=[],
             )
         )
 
@@ -502,19 +519,18 @@ def build_tools(client: DomainApiClient) -> Sequence[BaseTool]:
                     "region": region,
                     "stale_days": stale_days,
                 },
-                empty=[],
             )
         )
 
     @tool(args_schema=AssetIdArgs)
     async def get_checkout_history(asset_id: int) -> str:
         """Get checkout history for one positive asset ID."""
-        return _result(await client.get(f"/checkouts/asset/{asset_id}", empty=[]))
+        return _result(await client.get(f"/checkouts/asset/{asset_id}"))
 
     @tool(args_schema=UserIdArgs)
     async def get_user_assets(user_id: int) -> str:
         """List current assets for one positive user ID."""
-        return _result(await client.get(f"/checkouts/user/{user_id}", empty=[]))
+        return _result(await client.get(f"/checkouts/user/{user_id}"))
 
     @tool(args_schema=SearchUsersArgs)
     async def search_users_by_department(
@@ -526,7 +542,6 @@ def build_tools(client: DomainApiClient) -> Sequence[BaseTool]:
             await client.get(
                 "/users/search",
                 params={"department": department, "q": query},
-                empty=[],
             )
         )
 

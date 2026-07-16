@@ -13,3 +13,21 @@ Governed by:
     in 00-roadmap-and-contracts.md
   §"agent/app/routing.py" in 02-langgraph-agent.md
 """
+
+from typing import Literal
+
+from langchain_core.messages import AIMessage
+from langgraph.graph import END
+
+from app.state import AgentState
+
+
+def route_after_model(state: AgentState) -> Literal["tools", "__end__"]:
+    message = state["messages"][-1]
+    if isinstance(message, AIMessage) and message.tool_calls:
+        return "tools"
+    return END
+
+
+def route_after_tools(state: AgentState) -> Literal["model", "finalize"]:
+    return "finalize" if state.get("soft_limit_reached", False) else "model"

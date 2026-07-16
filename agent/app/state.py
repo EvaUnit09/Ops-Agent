@@ -11,3 +11,10 @@ Governed by:
   §"Graph loop and termination contract" in 00-roadmap-and-contracts.md
   §"agent/app/state.py" in 02-langgraph-agent.md
 """
+
+from langgraph.graph import MessagesState
+
+
+class AgentState(MessagesState):
+    tool_rounds: int
+    soft_limit_reached: bool

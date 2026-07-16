@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 TEST_DATABASE_URL = os.getenv(
     "TEST_DATABASE_URL",
-    "postgresql+psycopg://ops_agent:ops_agent@localhost:5432/ops_agent_test",
+    "postgresql+psycopg://opsagent:opsagent@localhost:5432/opsagent_test",
 )
 if not make_url(TEST_DATABASE_URL).database.endswith("_test"):
     raise RuntimeError("TEST_DATABASE_URL database name must end in '_test'")

@@ -1,0 +1,183 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      agent: ${{ steps.filter.outputs.agent }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      stack: ${{ steps.filter.outputs.stack }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            api:
+              - 'api/**'
+              - 'tests/e2e/**'
+              - 'scripts/smoke.py'
+              - '.github/workflows/ci.yml'
+            agent:
+              - 'agent/**'
+              - 'tests/e2e/**'
+              - 'scripts/**'
+              - '.github/workflows/ci.yml'
+            frontend:
+              - 'frontend/**'
+              - '.github/workflows/ci.yml'
+            stack:
+              - 'api/**'
+              - 'agent/**'
+              - 'frontend/**'
+              - 'tests/e2e/**'
+              - 'scripts/**'
+              - 'docker-compose.yml'
+              - '.env.example'
+              - '.github/workflows/ci.yml'
+
+  api:
+    needs: changes
+    if: needs.changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load Postgres identity from .env.example
+        id: env
+        run: |
+          set -a
+          source .env.example
+          set +a
+          echo "postgres_user=${POSTGRES_USER}" >> "$GITHUB_OUTPUT"
+          echo "postgres_password=${POSTGRES_PASSWORD}" >> "$GITHUB_OUTPUT"
+          echo "postgres_db=${POSTGRES_DB}" >> "$GITHUB_OUTPUT"
+      - name: Start Postgres matching .env.example credentials
+        run: |
+          docker run -d --name ci-postgres \
+            -e POSTGRES_USER="${{ steps.env.outputs.postgres_user }}" \
+            -e POSTGRES_PASSWORD="${{ steps.env.outputs.postgres_password }}" \
+            -e POSTGRES_DB="${{ steps.env.outputs.postgres_db }}_test" \
+            -p 5432:5432 \
+            postgres:16
+      - name: Wait for Postgres readiness
+        run: |
+          for _ in $(seq 1 20); do
+            docker exec ci-postgres pg_isready \
+              -U "${{ steps.env.outputs.postgres_user }}" \
+              -d "${{ steps.env.outputs.postgres_db }}_test" && break
+            sleep 3
+          done
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: api/uv.lock
+      - working-directory: api
+        run: uv sync --locked --all-groups
+      - working-directory: api
+        run: uv run ruff check .
+      - working-directory: api
+        run: uv run python -m compileall app alembic tests
+      - working-directory: api
+        env:
+          DATABASE_URL: "postgresql+psycopg://${{ steps.env.outputs.postgres_user }}:${{ steps.env.outputs.postgres_password }}@localhost:5432/${{ steps.env.outputs.postgres_db }}_test"
+          TEST_DATABASE_URL: "postgresql+psycopg://${{ steps.env.outputs.postgres_user }}:${{ steps.env.outputs.postgres_password }}@localhost:5432/${{ steps.env.outputs.postgres_db }}_test"
+        run: |
+          uv run alembic upgrade head
+          uv run pytest --cov=app --cov-report=term-missing
+
+  agent:
+    needs: changes
+    if: needs.changes.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    env:
+      LANGCHAIN_TRACING_V2: "false"
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: agent/uv.lock
+      - run: uv sync --locked --all-groups
+      - run: uv run ruff check .
+      - run: uv run pytest --cov=app --cov-report=term-missing -m "not live"
+
+  frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  clean-clone:
+    needs: changes
+    if: needs.changes.outputs.stack == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ANTHROPIC_API_KEY: ci-not-a-real-key
+      LANGCHAIN_TRACING_V2: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - run: docker compose config --quiet
+      - run: docker compose build
+      - run: docker compose up --detach --wait --wait-timeout 180
+      - run: python3 scripts/smoke.py
+      - name: Show container diagnostics
+        if: failure()
+        run: docker compose ps --all && docker compose logs --no-color
+      - name: Tear down
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
+  required:
+    name: Required CI
+    if: always()
+    needs: [changes, api, agent, frontend, clean-clone]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify selected jobs
+        env:
+          RESULTS: ${{ join(needs.*.result, ',') }}
+        run: |
+          case ",$RESULTS," in
+            *,failure,*|*,cancelled,*) exit 1 ;;
+            *) exit 0 ;;
+          esac

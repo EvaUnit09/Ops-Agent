@@ -33,6 +33,7 @@ packages = ["app"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "--strict-markers"
+markers = ["live: calls a running stack and may spend provider credits"]
 
 [tool.ruff]
 target-version = "py313"

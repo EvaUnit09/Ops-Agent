@@ -7,7 +7,7 @@ from app import services
 from app.models import Asset, AssetCategory, AssetStatus, Region
 
 
-def test_asset_search_needs_no_q_and_applies_filters(
+def test_asset_search_applies_enum_filters(
     client: TestClient,
     sample_data: dict[str, int],
 ) -> None:
@@ -26,19 +26,6 @@ def test_asset_search_needs_no_q_and_applies_filters(
     assert [item["tag"] for item in body["data"]] == ["AST-000001"]
     assert body["data"][0]["current_holder"] is None
     assert body["meta"] == {"count": 1, "limit": 2}
-
-
-def test_asset_search_combines_optional_q_and_enums(
-    client: TestClient,
-    sample_data: dict[str, int],
-) -> None:
-    response = client.get(
-        "/assets/search",
-        params={"q": "thinkpad", "category": "laptop"},
-    )
-
-    assert response.status_code == 200
-    assert [item["tag"] for item in response.json()["data"]] == ["AST-000002"]
 
 
 def test_stale_service_includes_asset_exactly_at_cutoff(
@@ -125,13 +112,3 @@ def test_asset_detail_and_not_found_share_envelope(
         },
         "meta": {"count": 0, "limit": None},
     }
-
-
-def test_asset_search_rejects_supplied_blank_q(
-    client: TestClient,
-) -> None:
-    response = client.get("/assets/search", params={"q": "   "})
-
-    assert response.status_code == 422
-    assert set(response.json()) == {"data", "error", "meta"}
-    assert response.json()["error"]["code"] == "http_422"

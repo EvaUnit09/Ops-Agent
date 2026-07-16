@@ -66,21 +66,12 @@ def _checkout_read(
 
 def search_assets(
     session: Session,
-    query: str | None,
     category: AssetCategory | None,
     status: AssetStatus | None,
     region: Region | None,
     limit: int,
 ) -> list[AssetRead]:
     statement = _asset_with_holder_statement()
-    if query is not None:
-        needle = query.strip().lower()
-        statement = statement.where(
-            or_(
-                func.strpos(func.lower(Asset.tag), needle) > 0,
-                func.strpos(func.lower(Asset.model), needle) > 0,
-            )
-        )
     if category is not None:
         statement = statement.where(Asset.category == category)
     if status is not None:

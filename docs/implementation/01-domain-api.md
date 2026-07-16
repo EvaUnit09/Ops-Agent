@@ -190,7 +190,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     app_name: str = "Ops Agent Domain API"
-    database_url: str = "postgresql+psycopg://ops_agent:ops_agent@db:5432/ops_agent"
+    database_url: str = "postgresql+psycopg://opsagent:opsagent@db:5432/opsagent"
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -584,21 +584,12 @@ def _checkout_read(
 
 def search_assets(
     session: Session,
-    query: str | None,
     category: AssetCategory | None,
     status: AssetStatus | None,
     region: Region | None,
     limit: int,
 ) -> list[AssetRead]:
     statement = _asset_with_holder_statement()
-    if query is not None:
-        needle = query.strip().lower()
-        statement = statement.where(
-            or_(
-                func.strpos(func.lower(Asset.tag), needle) > 0,
-                func.strpos(func.lower(Asset.model), needle) > 0,
-            )
-        )
     if category is not None:
         statement = statement.where(Asset.category == category)
     if status is not None:
@@ -735,7 +726,7 @@ def search_users(
     return [UserRead.model_validate(user) for user in session.scalars(statement)]
 ```
 
-Services own query construction and response projection; routers only validate HTTP input, compute request-scoped cutoffs, check addressed parents, and wrap results. `strpos` performs literal, case-insensitive containment when `q` is supplied, so `%` and `_` are not silently treated as wildcard syntax. Omitting `q` leaves only the bounded enum filters. All SQL values remain bound parameters.
+Services own query construction and response projection; routers only validate HTTP input, compute request-scoped cutoffs, check addressed parents, and wrap results. `search_assets` accepts only bounded enum filters and a limit—no free-text query. `/users/search`'s `q`, by contrast, uses `strpos` for literal, case-insensitive containment, so `%` and `_` are not silently treated as wildcard syntax; omitting `q` there leaves only the required department scope. All SQL values remain bound parameters.
 
 Asset list queries fetch the possible open checkout and holder in one statement. The database constraint makes the join cardinality at most one holder per asset. Department and current-user filtering explicitly join through open checkouts, so checkout state—not `assets.status`—determines holder identity. Both stale paths use an inclusive `<= cutoff` predicate.
 
@@ -799,7 +790,6 @@ Limit = Annotated[int, Query(ge=1, le=100)]
 
 @router.get("/search", response_model=ApiResponse[list[AssetRead]])
 def search_assets(
-    q: Annotated[str | None, Query(min_length=1, max_length=100)] = None,
     category: AssetCategory | None = None,
     status_filter: Annotated[
         AssetStatus | None,
@@ -809,12 +799,7 @@ def search_assets(
     limit: Limit = 50,
     session: Session = Depends(get_db),
 ) -> ApiResponse[list[AssetRead]]:
-    if q is not None and not q.strip():
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="q must contain a non-whitespace character",
-        )
-    items = services.search_assets(session, q, category, status_filter, region, limit)
+    items = services.search_assets(session, category, status_filter, region, limit)
     return success(items, count=len(items), limit=limit)
 
 
@@ -885,7 +870,7 @@ def get_asset(
     return success(item, count=1)
 ```
 
-Static paths are declared before `/{asset_id}` so `search`, `stale`, and `by-department` cannot be interpreted as IDs. `/assets/search` accepts no required search text: `q`, `category`, `status`, and `region` are independently optional, while `limit` bounds every search. The HTTP query parameter remains `status`; the local name `status_filter` avoids shadowing FastAPI's imported status module.
+Static paths are declared before `/{asset_id}` so `search`, `stale`, and `by-department` cannot be interpreted as IDs. `/assets/search` accepts no free-text query at all: `category`, `status`, and `region` are independently optional enum filters, while `limit` bounds every search. The HTTP query parameter remains `status`; the local name `status_filter` avoids shadowing FastAPI's imported status module.
 
 `/assets/stale` and `/assets/by-department` compute one UTC cutoff in the router and the service applies the inclusive `last_synced_at <= cutoff` rule. `/assets/by-department` requires `department` and accepts optional `category`, `status`, `region`, and `stale_days`; `limit` remains the shared bounded-collection transport control.
 
@@ -1622,7 +1607,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 TEST_DATABASE_URL = os.getenv(
     "TEST_DATABASE_URL",
-    "postgresql+psycopg://ops_agent:ops_agent@localhost:5432/ops_agent_test",
+    "postgresql+psycopg://opsagent:opsagent@localhost:5432/opsagent_test",
 )
 if not make_url(TEST_DATABASE_URL).database.endswith("_test"):
     raise RuntimeError("TEST_DATABASE_URL database name must end in '_test'")
@@ -1772,7 +1757,7 @@ from app import services
 from app.models import Asset, AssetCategory, AssetStatus, Region
 
 
-def test_asset_search_needs_no_q_and_applies_filters(
+def test_asset_search_applies_enum_filters(
     client: TestClient,
     sample_data: dict[str, int],
 ) -> None:
@@ -1791,19 +1776,6 @@ def test_asset_search_needs_no_q_and_applies_filters(
     assert [item["tag"] for item in body["data"]] == ["AST-000001"]
     assert body["data"][0]["current_holder"] is None
     assert body["meta"] == {"count": 1, "limit": 2}
-
-
-def test_asset_search_combines_optional_q_and_enums(
-    client: TestClient,
-    sample_data: dict[str, int],
-) -> None:
-    response = client.get(
-        "/assets/search",
-        params={"q": "thinkpad", "category": "laptop"},
-    )
-
-    assert response.status_code == 200
-    assert [item["tag"] for item in response.json()["data"]] == ["AST-000002"]
 
 
 def test_stale_service_includes_asset_exactly_at_cutoff(
@@ -1890,19 +1862,9 @@ def test_asset_detail_and_not_found_share_envelope(
         },
         "meta": {"count": 0, "limit": None},
     }
-
-
-def test_asset_search_rejects_supplied_blank_q(
-    client: TestClient,
-) -> None:
-    response = client.get("/assets/search", params={"q": "   "})
-
-    assert response.status_code == 422
-    assert set(response.json()) == {"data", "error", "meta"}
-    assert response.json()["error"]["code"] == "http_422"
 ```
 
-These tests prove that `q` is optional, all search filters compose, stale comparison is inclusive at the exact cutoff, department filtering uses the open checkout, and `/assets/{id}` remains intact. Asset collections use ascending integer IDs.
+These tests prove that all search filters compose without a free-text query, stale comparison is inclusive at the exact cutoff, department filtering uses the open checkout, and `/assets/{id}` remains intact. Asset collections use ascending integer IDs.
 
 ### `api/tests/test_checkouts.py`
 
@@ -2126,17 +2088,17 @@ Run all commands from the repository root unless the command starts with `cd api
 The existing root `docker-compose.yml` reads `.env`. For local development, ensure it contains:
 
 ```dotenv
-POSTGRES_USER=ops_agent
-POSTGRES_PASSWORD=ops_agent
-POSTGRES_DB=ops_agent
-DATABASE_URL=postgresql+psycopg://ops_agent:ops_agent@db:5432/ops_agent
+POSTGRES_USER=opsagent
+POSTGRES_PASSWORD=opsagent
+POSTGRES_DB=opsagent
+DATABASE_URL=postgresql+psycopg://opsagent:opsagent@db:5432/opsagent
 ```
 
 Start only PostgreSQL and create the isolated test database:
 
 ```bash
 docker compose up -d db
-docker compose exec db createdb -U ops_agent ops_agent_test
+docker compose exec db createdb -U opsagent opsagent_test
 ```
 
 If `createdb` reports that the test database already exists, continue.
@@ -2158,7 +2120,7 @@ Compilation catches indentation, import, and syntax errors before a database ope
 From `api/`, point host-side commands at `localhost`, not the Compose service name `db`:
 
 ```bash
-export DATABASE_URL=postgresql+psycopg://ops_agent:ops_agent@localhost:5432/ops_agent
+export DATABASE_URL=postgresql+psycopg://opsagent:opsagent@localhost:5432/opsagent
 uv run alembic upgrade head
 uv run alembic current
 uv run alembic check
@@ -2214,7 +2176,7 @@ At least `AST-000001` must be returned. Unqualified names intentionally verify t
 ### Step 5: run tests
 
 ```bash
-export TEST_DATABASE_URL=postgresql+psycopg://ops_agent:ops_agent@localhost:5432/ops_agent_test
+export TEST_DATABASE_URL=postgresql+psycopg://opsagent:opsagent@localhost:5432/opsagent_test
 uv run pytest --cov=app --cov-report=term-missing
 ```
 
